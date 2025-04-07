@@ -21,8 +21,8 @@ This is a simple Bash script to automate the installation and configuration of a
 ## 🚀 How to Use
 
 ```bash
-chmod +x prestashop-lamp-install.sh
-./prestashop-lamp-install.sh
+chmod +x lamp-install.sh
+./lamp-install.sh
 ```
 
 During execution, you will be prompted to:
