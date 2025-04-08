@@ -1,62 +1,78 @@
-# PrestaShop LAMP Stack Installer (Fedora)
 
-This is a simple Bash script to automate the installation and configuration of a **LAMP stack** (Linux, Apache, MariaDB, PHP) optimized for running **PrestaShop** on a **Fedora**-based system.
+# Fedora LAMP Stack Setup Script for PrestaShop 🚀
 
-## ⚙️ What It Does
+This script automates the installation and configuration of a full LAMP stack (Linux, Apache, MariaDB, PHP) on **Fedora** for use with **PrestaShop** or other PHP-based web applications. It applies ideal file permissions, enables SELinux compatibility, and prepares your server for web development or deployment.
 
-- Updates system packages
-- Installs Apache HTTP server
-- Installs PHP 8.3 via Remi repository with all required PrestaShop extensions
-- Installs and configures MariaDB
-- Secures the MySQL installation and creates a new database + admin user
-- Sets permissions and SELinux rules for `/var/www/html`
-- Opens HTTP and HTTPS ports in the firewall
-- Generates a `phpinfo()` test file to verify PHP is working
+---
 
-## 📦 Requirements
+## 🚩 Quick Start
 
-- Fedora-based Linux distribution (tested on Fedora 41+)
-- Root privileges (use `sudo` to run the script)
-
-## 🚀 How to Use
+Clone or download the script, then execute:
 
 ```bash
-chmod +x lamp-install.sh
-./lamp-install.sh
+cd ~/Documents
+chmod +x lamp-setup.sh
+./lamp-setup.sh | tee lamp-install-log.txt
 ```
 
-During execution, you will be prompted to:
+> ✅ Logs of the installation process will be saved to `lamp-install-log.txt`.
 
-- Provide a MySQL admin username and password
-- Define a new database name
+---
 
-## 🔒 Security Notes
+## ⚙️ Features & Components
 
-- The script runs `mysql_secure_installation`, which will ask you to secure your root password and disable anonymous access.
-- SELinux and firewall settings are configured to allow Apache access and outbound connections.
+### ✨ LAMP Stack Installation
+- Apache HTTP Server
+- PHP (choice of 8.1 or 8.3 via Remi repo)
+- PHP extensions required for PrestaShop
+- MariaDB (MySQL-compatible database)
 
-## 📁 Where to Place Your PrestaShop Files
+### 🔐 MySQL Configuration
+- Prompts for secure installation
+- Creates a new admin MySQL user and database with full privileges
 
-Place your PrestaShop files in:
+### 🔧 File Permissions & SELinux
+- Ownership: `youruser:apache`
+- Directories: `775`, Files: `664`
+- Sticky group bit (`g+s`) on all dirs
+- Sets default ACLs so new files/folders inherit correct permissions
+- Applies proper SELinux context: `httpd_sys_rw_content_t`
 
-```
-/var/www/html
-```
+### 🚀 Automation Enhancements
+- Ensures Apache and PHP-FPM start and enable at boot
+- Opens firewall ports for HTTP & HTTPS
+- Creates `phpinfo.php` to verify installation
 
-Visit `http://<your-server-ip>/phpinfo.php` to verify your PHP setup.
+### 👨‍💻 Developer-Friendly Defaults
+- New folders under `/var/www/html` automatically inherit web-safe permissions
+- No need to re-run permission fixers when adding projects
 
-## 📷 Output Example
+---
 
-```
- ✅ LAMP STACK INSTALLED SUCCESSFULLY
- Server IP Address         : 192.168.1.100
- Apache Root               : /var/www/html
- MySQL Admin User          : prestashop_admin
- MySQL Admin Database      : prestashop_db
- PHP Info Page             : http://192.168.1.100/phpinfo.php
- Drop your PrestaShop files into /var/www/html
-```
+## 📊 Requirements
 
-## 🛠 Author
+- Fedora Workstation or Server (tested on Fedora 39–41)
+- Root access / `sudo`
+- Internet connection
 
-This script was created to make PrestaShop setup easier and faster for developers and sysadmins working on Fedora servers.
+---
+
+## ⚠️ Recommendations
+
+- Backup important data before running the script.
+- Review the script to adjust MySQL and directory settings if needed.
+- After installation, reboot your system to ensure all changes apply.
+
+---
+
+## 🖥️ Tested Environment
+
+- Fedora 41 Workstation (GNOME)
+- SELinux: Enforcing
+- Apache 2.4, PHP 8.1/8.3, MariaDB 10.5+
+
+---
+
+## 🤝 Contributions & Issues
+
+Feel free to report issues, request features, or submit pull requests to improve this script. Whether you're deploying PrestaShop or using this as a base LAMP stack, your feedback helps make it better for everyone!
