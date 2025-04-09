@@ -15,15 +15,18 @@ install_lamp_stack() {
     sudo systemctl start httpd
     sudo systemctl enable httpd
 
-    echo ""
     echo "🧠 Select PHP version:"
     echo "1) PHP 8.1"
-    echo "2) PHP 8.3"
-    read -p "📌 Selection (1 or 2): " PHP_CHOICE
+    echo "2) PHP 8.2"
+    echo "3) PHP 8.3"
+    echo "4) PHP 8.4 (⚠️ Experimental)"
+    read -p "📌 Selection (1–4): " PHP_CHOICE
 
     case "$PHP_CHOICE" in
         1) PHP_VERSION="8.1" ;;
-        2) PHP_VERSION="8.3" ;;
+        2) PHP_VERSION="8.2" ;;
+        3) PHP_VERSION="8.3" ;;
+        4) PHP_VERSION="8.4" ;;
         *) echo "❌ Invalid selection. Exiting."; exit 1 ;;
     esac
 
