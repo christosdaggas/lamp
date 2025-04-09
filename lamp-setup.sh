@@ -14,7 +14,18 @@ install_lamp_stack() {
     sudo dnf install httpd -y
     sudo systemctl start httpd
     sudo systemctl enable httpd
+    
+    echo "🔐 Setting SELinux permissions for Apache..."
+    sudo setsebool -P httpd_unified 1
 
+    echo "Allowing Apache to make outbound connections..."
+    sudo setsebool -P httpd_can_network_connect 1
+
+    echo "Opening firewall ports for HTTP and HTTPS..."
+    sudo firewall-cmd --add-service=http --permanent
+    sudo firewall-cmd --add-service=https --permanent
+    sudo firewall-cmd --reload
+    
     echo "🧠 Select PHP version:"
     echo "1) PHP 8.1"
     echo "2) PHP 8.2"
