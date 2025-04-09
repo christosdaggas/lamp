@@ -1,4 +1,4 @@
-# Fedora LAMP Manager Script for PrestaShop 🚀
+# Fedora LAMP Manager Script 🚀
 
 This script provides a **modular, interactive way** to install, manage, and uninstall a complete LAMP stack (Linux, Apache, MariaDB, PHP) on **Fedora** systems. It’s built for developers working with **PrestaShop** or any PHP-based platform, offering smart defaults, permission automation, and rollback options.
 
