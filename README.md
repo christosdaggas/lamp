@@ -9,7 +9,7 @@ This script provides a **modular, interactive way** to install, manage, and unin
 Clone or download the script, then execute:
 
 ```bash
-cd ~/Documents
+cd ~/Downloads
 chmod +x lamp-manager.sh
 ./lamp-manager.sh | tee lamp-log.txt
 ```
@@ -92,9 +92,9 @@ chmod +x lamp-manager.sh
 
 ## 🖥️ Tested Environment
 
-- Fedora 41 Workstation (GNOME)
+- Fedora 41 Workstation
 - SELinux: Enforcing
-- Apache 2.4, PHP 8.1/8.3, MariaDB 10.5+
+- Apache 2.4, PHP 8.1/8.4, MariaDB 10.5+
 - FirewallD enabled
 
 ---
