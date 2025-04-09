@@ -22,7 +22,7 @@ chmod +x lamp-manager.sh
 
 ### ✨ Modular LAMP Stack Management
 - Apache HTTP Server installation & removal
-- PHP (choose between 8.1 or 8.3 via Remi repo)
+- PHP (choose between 8.1 to 8.4 via Remi repo)
 - PrestaShop-required PHP extensions
 - MariaDB installation, configuration & safe removal (with backup)
 
