@@ -56,7 +56,7 @@ chmod +x lamp-manager.sh
 
 ## 📊 Requirements
 
-- Fedora Workstation or Server (tested on Fedora 39–41)
+- Fedora Workstation or Server (tested on Fedora 41–42)
 - `sudo` privileges
 - Internet connection
 - Basic familiarity with command line
@@ -92,7 +92,7 @@ chmod +x lamp-manager.sh
 
 ## 🖥️ Tested Environment
 
-- Fedora 41 Workstation
+- Fedora 41 & 42 Workstation
 - SELinux: Enforcing
 - Apache 2.4, PHP 8.1/8.4, MariaDB 10.5+
 - FirewallD enabled
