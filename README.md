@@ -10,8 +10,8 @@ Clone or download the script, then execute:
 
 ```bash
 cd ~/Downloads
-chmod +x lamp-manager.sh
-./lamp-manager.sh | tee lamp-log.txt
+chmod +x lamp-setup.sh
+./lamp-setup.sh | tee lamp-log.txt
 ```
 
 > ✅ Logs of the session will be saved to `lamp-log.txt` for review.
