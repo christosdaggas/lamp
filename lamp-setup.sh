@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fedora 43 - LAMP DEV Manager (v3.6 - ssl.conf fix)
+# Fedora 43 - LAMP DEV Manager (v3.7 - MariaDB init + DB create option)
 # Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt,
 # ACL+SELinux permissions, Self-Signed SSL, Let's Encrypt SSL, Backup/Restore, Live Log Tailer
 
@@ -77,18 +77,13 @@ ensure_httpd_ssl_sane() {
   local sslconf="/etc/httpd/conf.d/ssl.conf"
   local disabled="/etc/httpd/conf.d/ssl.conf.disabled"
 
-  # If already disabled, do nothing
   [[ -f "$disabled" ]] && return 0
-
   [[ -f "$sslconf" ]] || return 0
 
-  # Extract referenced cert/key paths (strip quotes)
-  local cert key
+  local cert key bad=0
   cert="$(sudo awk '/^[[:space:]]*SSLCertificateFile[[:space:]]+/ {print $2; exit}' "$sslconf" 2>/dev/null | tr -d '"')"
   key="$(sudo awk '/^[[:space:]]*SSLCertificateKeyFile[[:space:]]+/ {print $2; exit}' "$sslconf" 2>/dev/null | tr -d '"')"
 
-  # If ssl.conf points to non-existent or empty files -> disable it
-  local bad=0
   [[ -n "$cert" && ! -s "$cert" ]] && bad=1
   [[ -n "$key"  && ! -s "$key"  ]] && bad=1
 
@@ -148,10 +143,8 @@ install_apache_php() {
   sudo dnf upgrade --refresh -y
   sudo dnf install -y httpd mod_http2 mod_ssl openssl
 
-  # Disable broken default ssl.conf if it blocks httpd (your reported error)
   ensure_httpd_ssl_sane
 
-  # Ensure proxy modules for PHP-FPM handler
   if ! sudo httpd -M 2>/dev/null | grep -q proxy_fcgi_module; then
     sudo bash -c 'cat >/etc/httpd/conf.modules.d/99-proxy-fcgi.conf' <<'EOF'
 LoadModule proxy_module modules/mod_proxy.so
@@ -159,7 +152,6 @@ LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
 EOF
   fi
 
-  # PrestaShop-friendly PHP modules
   sudo dnf install -y \
     php php-fpm php-cli php-common \
     php-mysqlnd php-zip php-devel \
@@ -169,7 +161,6 @@ EOF
   open_firewall_service http
   open_firewall_service https
 
-  # Apache base config
   sudo bash -c "cat >'${APACHE_BASE_CONF}'" <<'EOF'
 ServerName localhost
 <Directory "/var/www/html">
@@ -179,7 +170,6 @@ ServerName localhost
 </Directory>
 EOF
 
-  # PHP-FPM socket config
   sudo sed -i \
     -e 's~^;*listen\s*=.*~listen = /run/php-fpm/www.sock~' \
     -e 's~^;*listen\.owner\s*=.*~listen.owner = apache~' \
@@ -187,14 +177,12 @@ EOF
     -e 's~^;*listen\.mode\s*=.*~listen.mode = 0660~' \
     "${PHPFPM_POOL_CONF}"
 
-  # Apache handler for PHP
   sudo bash -c "cat >'${APACHE_PHPFPM_HANDLER_CONF}'" <<'EOF'
 <FilesMatch \.php$>
   SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
 </FilesMatch>
 EOF
 
-  # PHP dev ini
   sudo bash -c "cat >'${PHP_DEV_INI}'" <<'EOF'
 display_errors=On
 display_startup_errors=On
@@ -235,6 +223,77 @@ EOF
 
   sudo systemctl restart mariadb
   open_firewall_port 3306/tcp
+}
+
+# ============================================================
+# NEW: MariaDB init + create database/user
+# ============================================================
+ensure_mariadb_initialized() {
+  # Ensure datadir exists and is initialized. Most Fedora installs do this automatically,
+  # but this makes it explicit and safe for edge cases.
+  local datadir="/var/lib/mysql"
+
+  sudo mkdir -p "$datadir"
+  if [[ ! -d "${datadir}/mysql" ]] || [[ -z "$(sudo ls -A "${datadir}/mysql" 2>/dev/null || true)" ]]; then
+    warn "MariaDB datadir appears uninitialized. Initializing..."
+    if command -v mariadb-install-db >/dev/null 2>&1; then
+      sudo mariadb-install-db --user=mysql --datadir="$datadir" >/dev/null
+    elif command -v mysql_install_db >/dev/null 2>&1; then
+      sudo mysql_install_db --user=mysql --datadir="$datadir" >/dev/null
+    else
+      err "No mariadb-install-db/mysql_install_db found."
+      return 1
+    fi
+  fi
+}
+
+mariadb_init_and_create_db() {
+  msg "Initializing MariaDB (if needed) and creating database/user..."
+
+  # Ensure MariaDB is installed/running
+  if ! rpm -q mariadb-server >/dev/null 2>&1; then
+    install_mariadb_dev
+  else
+    sudo systemctl enable --now mariadb
+  fi
+
+  ensure_mariadb_initialized
+  sudo systemctl restart mariadb
+
+  # Optional secure wizard (interactive)
+  read -rp "Run mysql_secure_installation now? (y/N): " SEC
+  SEC="${SEC:-N}"
+  if [[ "$SEC" =~ ^[Yy]$ ]]; then
+    sudo mysql_secure_installation || true
+  fi
+
+  # Create DB + user
+  read -rp "Database name (e.g. prestashop_db): " DB_NAME
+  [[ -n "$DB_NAME" ]] || { err "Database name is required."; return 1; }
+
+  read -rp "DB username (e.g. ps_user): " DB_USER
+  [[ -n "$DB_USER" ]] || { err "DB username is required."; return 1; }
+
+  read -srp "DB password: " DB_PASS
+  echo
+  [[ -n "$DB_PASS" ]] || { err "DB password is required."; return 1; }
+
+  read -rp "DB host (default: localhost, use % for remote): " DB_HOST
+  DB_HOST="${DB_HOST:-localhost}"
+
+  read -rp "Allow this user to CREATE/DROP databases (for PrestaShop 'Create Now')? (y/N): " ALLOW_CREATE
+  ALLOW_CREATE="${ALLOW_CREATE:-N}"
+
+  msg "Applying SQL (utf8mb4)..."
+  sudo mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';
+$( [[ "$ALLOW_CREATE" =~ ^[Yy]$ ]] && echo "GRANT CREATE, DROP ON *.* TO '${DB_USER}'@'${DB_HOST}';" )
+FLUSH PRIVILEGES;
+SQL
+
+  msg "MariaDB initialized. DB/user created successfully."
 }
 
 # ============================================================
@@ -379,8 +438,6 @@ issue_lets_encrypt_ssl() {
   open_firewall_service https
 
   sudo dnf install -y certbot python3-certbot-apache mod_ssl
-
-  # Ensure default ssl.conf isn't blocking httpd
   ensure_httpd_ssl_sane
 
   select_vhost || return 1
@@ -528,7 +585,7 @@ restore_project() {
 # ============================================================
 main_menu() {
   while true; do
-    echo -e "\n--- Fedora 43 LAMP DEV (v3.6) ---"
+    echo -e "\n--- Fedora 43 LAMP DEV (v3.7) ---"
     echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
     echo "2) Create New VHost"
     echo "3) Issue Self-Signed SSL"
@@ -538,6 +595,7 @@ main_menu() {
     echo "7) Smart Restore (Files + optional DB)"
     echo "8) Re-apply permissions on /var/www/html"
     echo "9) Restart services"
+    echo "10) Initialize MariaDB + Create DB/User"
     echo "0) Exit"
     read -rp "Choice: " C
     case "$C" in
@@ -550,6 +608,7 @@ main_menu() {
       7) restore_project ;;
       8) apply_dev_permissions ;;
       9) sudo systemctl restart mariadb 2>/dev/null || true; sudo systemctl restart php-fpm 2>/dev/null || true; sudo systemctl restart httpd 2>/dev/null || true; msg "Services restarted." ;;
+      10) mariadb_init_and_create_db ;;
       0) exit 0 ;;
       *) err "Invalid choice." ;;
     esac
