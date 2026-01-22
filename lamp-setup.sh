@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fedora 43 - LAMP DEV Installer (v3.5)
-# Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt, SELinux+ACL perms,
-# Self-Signed SSL, Let's Encrypt SSL, Backup + Smart Restore, Live Log Tailer
+# Fedora 43 - LAMP DEV Manager (v3.6 - ssl.conf fix)
+# Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt,
+# ACL+SELinux permissions, Self-Signed SSL, Let's Encrypt SSL, Backup/Restore, Live Log Tailer
 
 set -euo pipefail
 
@@ -34,8 +34,16 @@ err(){ echo -e "\033[1;31m[ERROR] $*\033[0m"; }
 # ============================================================
 require_cmd(){ command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
 getenforce_safe(){ command -v getenforce >/dev/null 2>&1 && getenforce || echo "Disabled"; }
-apache_configtest(){ sudo apachectl configtest; }
-safe_reload_httpd(){ apache_configtest; sudo systemctl reload httpd; }
+
+apache_configtest(){
+  ensure_httpd_ssl_sane
+  sudo apachectl configtest
+}
+
+safe_reload_httpd(){
+  apache_configtest
+  sudo systemctl reload httpd
+}
 
 ask_user() {
   local default_user
@@ -59,6 +67,34 @@ open_firewall_port() {
   if command -v firewall-cmd >/dev/null 2>&1; then
     sudo firewall-cmd --add-port="$port" --permanent >/dev/null 2>&1 || true
     sudo firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+# ============================================================
+# FIX Fedora default ssl.conf if it references missing localhost cert/key
+# ============================================================
+ensure_httpd_ssl_sane() {
+  local sslconf="/etc/httpd/conf.d/ssl.conf"
+  local disabled="/etc/httpd/conf.d/ssl.conf.disabled"
+
+  # If already disabled, do nothing
+  [[ -f "$disabled" ]] && return 0
+
+  [[ -f "$sslconf" ]] || return 0
+
+  # Extract referenced cert/key paths (strip quotes)
+  local cert key
+  cert="$(sudo awk '/^[[:space:]]*SSLCertificateFile[[:space:]]+/ {print $2; exit}' "$sslconf" 2>/dev/null | tr -d '"')"
+  key="$(sudo awk '/^[[:space:]]*SSLCertificateKeyFile[[:space:]]+/ {print $2; exit}' "$sslconf" 2>/dev/null | tr -d '"')"
+
+  # If ssl.conf points to non-existent or empty files -> disable it
+  local bad=0
+  [[ -n "$cert" && ! -s "$cert" ]] && bad=1
+  [[ -n "$key"  && ! -s "$key"  ]] && bad=1
+
+  if [[ "$bad" -eq 1 ]]; then
+    warn "Detected broken default ssl.conf (missing/empty cert/key). Disabling: $sslconf"
+    sudo mv "$sslconf" "$disabled"
   fi
 }
 
@@ -112,6 +148,9 @@ install_apache_php() {
   sudo dnf upgrade --refresh -y
   sudo dnf install -y httpd mod_http2 mod_ssl openssl
 
+  # Disable broken default ssl.conf if it blocks httpd (your reported error)
+  ensure_httpd_ssl_sane
+
   # Ensure proxy modules for PHP-FPM handler
   if ! sudo httpd -M 2>/dev/null | grep -q proxy_fcgi_module; then
     sudo bash -c 'cat >/etc/httpd/conf.modules.d/99-proxy-fcgi.conf' <<'EOF'
@@ -164,7 +203,7 @@ log_errors=On
 memory_limit=512M
 max_execution_time=300
 max_input_time=300
-max_input_vars=20000
+max_input_vars=10000
 upload_max_filesize=256M
 post_max_size=256M
 date.timezone=Europe/Athens
@@ -341,8 +380,10 @@ issue_lets_encrypt_ssl() {
 
   sudo dnf install -y certbot python3-certbot-apache mod_ssl
 
-  select_vhost || return 1
+  # Ensure default ssl.conf isn't blocking httpd
+  ensure_httpd_ssl_sane
 
+  select_vhost || return 1
   read -rp "Email for Let's Encrypt: " EM
   [[ -n "$EM" ]] || { err "Email is required."; return 1; }
 
@@ -353,7 +394,7 @@ issue_lets_encrypt_ssl() {
 }
 
 # ============================================================
-# BACKUP + LIVE LOGS + SMART RESTORE
+# BACKUP + LOGS + RESTORE
 # ============================================================
 backup_project() {
   select_vhost || return 1
@@ -363,7 +404,6 @@ backup_project() {
   BDIR="${BACKUP_BASE}/${SEL_DOMAIN}_${TS}"
   mkdir -p "$BDIR"
 
-  # Store basic metadata
   cat > "${BDIR}/meta.txt" <<EOF
 domain=${SEL_DOMAIN}
 docroot=${SEL_DOCROOT}
@@ -388,16 +428,13 @@ EOF
   fi
 
   sudo dnf install -y zip >/dev/null 2>&1 || true
-
   msg "Archiving files (docroot contents)..."
-  # Zip only the CONTENTS of docroot so restore can target any VHost safely
   sudo bash -c "cd '$SEL_DOCROOT' && zip -r '$BDIR/files.zip' . >/dev/null"
 
   sudo chown -R "$USER_NAME:$USER_NAME" "$BDIR" || true
   msg "Backup ready at: $BDIR"
 }
 
-# ---------------- Live Log Tailer ----------------
 view_logs() {
   select_vhost || return 1
   local LOG_FILE="/var/log/httpd/${SEL_DOMAIN}_error.log"
@@ -412,7 +449,6 @@ view_logs() {
   sudo tail -n 20 -f "$LOG_FILE"
 }
 
-# ---------------- Smart Restore ----------------
 restore_project() {
   if [[ ! -d "$BACKUP_BASE" ]]; then
     err "Backups directory not found: $BACKUP_BASE"
@@ -449,20 +485,15 @@ restore_project() {
 
   sudo dnf install -y unzip >/dev/null 2>&1 || true
 
-  # Restore files
   if [[ -f "${SELECTED_B}files.zip" ]]; then
     msg "Restoring files into: ${SEL_DOCROOT}"
-
-    # Wipe docroot contents safely (including hidden files) without touching the directory itself
     sudo find "$SEL_DOCROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + >/dev/null 2>&1 || true
-
     sudo unzip -o "${SELECTED_B}files.zip" -d "$SEL_DOCROOT" >/dev/null
     msg "Files restored."
   else
     err "files.zip not found in backup."
   fi
 
-  # Restore DB
   if [[ -f "${SELECTED_B}db.sql" ]]; then
     read -rp "SQL dump found. Database name to import into: " RDB
     if [[ -n "$RDB" ]]; then
@@ -488,7 +519,6 @@ restore_project() {
     warn "No db.sql found in backup. DB restore skipped."
   fi
 
-  # Fix permissions after restore
   apply_web_permissions_tree "$SEL_DOCROOT"
   msg "Restore completed for VHost: ${SEL_DOMAIN}"
 }
@@ -498,7 +528,7 @@ restore_project() {
 # ============================================================
 main_menu() {
   while true; do
-    echo -e "\n--- Fedora 43 LAMP DEV---"
+    echo -e "\n--- Fedora 43 LAMP DEV (v3.6) ---"
     echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
     echo "2) Create New VHost"
     echo "3) Issue Self-Signed SSL"
