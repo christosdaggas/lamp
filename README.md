@@ -166,7 +166,3 @@ Includes:
 * SELinux: Enforcing
 * firewalld enabled
 * Apache httpd + PHP-FPM + MariaDB from Fedora repos
-
-```
-::contentReference[oaicite:0]{index=0}
-```
