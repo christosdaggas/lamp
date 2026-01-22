@@ -1,29 +1,30 @@
-```bash
 #!/usr/bin/env bash
-# Fedora 43 - LAMP DEV Installer (v3.4)
+# Fedora 43 - LAMP DEV Installer (v3.5)
 # Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt, SELinux+ACL perms,
-# Self-Signed SSL, Let's Encrypt SSL, Project backups (files + optional DB dump)
+# Self-Signed SSL, Let's Encrypt SSL, Backup + Smart Restore, Live Log Tailer
+
 set -euo pipefail
 
-# Path Variables
+# Paths
 WEB_DIR="/var/www/html"
 VHOST_PREFIX="/etc/httpd/conf.d/20-"
 SSL_CERT_DIR="/etc/pki/tls/certs"
 SSL_KEY_DIR="/etc/pki/tls/private"
+BACKUP_BASE="${HOME}/lamp_backups"
 
-# Config Files
+# Config files
 APACHE_BASE_CONF="/etc/httpd/conf.d/10-www.conf"
 APACHE_PHPFPM_HANDLER_CONF="/etc/httpd/conf.d/15-php-fpm.conf"
 PHP_DEV_INI="/etc/php.d/99-dev-prestashop.ini"
 PHPFPM_POOL_CONF="/etc/php-fpm.d/www.conf"
 MYSQL_REMOTE_CONF="/etc/my.cnf.d/60-remote.cnf"
 
-# State (selected vhost)
+# Selected VHost state
 SEL_DOMAIN=""
 SEL_DOCROOT=""
 SEL_CONF=""
 
-# Message helpers
+# Messages
 msg(){ echo -e "\033[1;32m[INFO] $*\033[0m"; }
 warn(){ echo -e "\033[1;33m[WARN] $*\033[0m"; }
 err(){ echo -e "\033[1;31m[ERROR] $*\033[0m"; }
@@ -163,13 +164,12 @@ log_errors=On
 memory_limit=512M
 max_execution_time=300
 max_input_time=300
-max_input_vars=10000
+max_input_vars=20000
 upload_max_filesize=256M
 post_max_size=256M
 date.timezone=Europe/Athens
 EOF
 
-  # SELinux booleans for dev networking
   if [[ "$(getenforce_safe)" != "Disabled" ]]; then
     sudo setsebool -P httpd_can_network_connect 1 || true
     sudo setsebool -P httpd_can_network_connect_db 1 || true
@@ -195,8 +195,6 @@ skip-networking = 0
 EOF
 
   sudo systemctl restart mariadb
-
-  # Deterministic: open the port, do not rely on service name
   open_firewall_port 3306/tcp
 }
 
@@ -212,7 +210,6 @@ apply_web_permissions_tree() {
     warn "User added to group apache. Logout/login recommended."
   fi
 
-  # Ensure web root base ownership + setgid
   if [[ "$target" == "$WEB_DIR" ]]; then
     sudo chown root:apache "$WEB_DIR"
     sudo chmod 2775 "$WEB_DIR"
@@ -234,7 +231,6 @@ apply_web_permissions_tree() {
 apply_dev_permissions() {
   apply_web_permissions_tree "$WEB_DIR"
 
-  # systemd UMask for service-created files (no global shell umask)
   for svc in httpd php-fpm; do
     local dir="/etc/systemd/system/${svc}.service.d"
     sudo mkdir -p "$dir"
@@ -244,7 +240,6 @@ apply_dev_permissions() {
   sudo systemctl daemon-reload
   sudo systemctl restart php-fpm httpd
 
-  # quick test page
   echo '<?php phpinfo();' | sudo tee "${WEB_DIR}/info.php" >/dev/null
 }
 
@@ -259,7 +254,6 @@ create_vhost() {
 
   sudo mkdir -p "$DOCROOT"
 
-  # Variable expansion required here
   sudo bash -c "cat >'${CONF}'" <<EOF
 <VirtualHost *:80>
   ServerName ${VHOST}
@@ -268,6 +262,8 @@ create_vhost() {
     AllowOverride All
     Require all granted
   </Directory>
+  ErrorLog  /var/log/httpd/${VHOST}_error.log
+  CustomLog /var/log/httpd/${VHOST}_access.log combined
 </VirtualHost>
 EOF
 
@@ -305,7 +301,7 @@ select_vhost() {
 }
 
 # ============================================================
-# SSL (Self-signed + Let's Encrypt)
+# SSL
 # ============================================================
 issue_self_signed_ssl() {
   select_vhost || return 1
@@ -357,15 +353,22 @@ issue_lets_encrypt_ssl() {
 }
 
 # ============================================================
-# BACKUP (Files + optional DB dump)
+# BACKUP + LIVE LOGS + SMART RESTORE
 # ============================================================
 backup_project() {
   select_vhost || return 1
 
   local TS BDIR
   TS="$(date +%Y%m%d_%H%M%S)"
-  BDIR="$HOME/lamp_backups/${SEL_DOMAIN}_${TS}"
+  BDIR="${BACKUP_BASE}/${SEL_DOMAIN}_${TS}"
   mkdir -p "$BDIR"
+
+  # Store basic metadata
+  cat > "${BDIR}/meta.txt" <<EOF
+domain=${SEL_DOMAIN}
+docroot=${SEL_DOCROOT}
+timestamp=${TS}
+EOF
 
   read -rp "Database name (leave empty to skip DB export): " DB_NAME
   if [[ -n "$DB_NAME" ]]; then
@@ -385,10 +388,109 @@ backup_project() {
   fi
 
   sudo dnf install -y zip >/dev/null 2>&1 || true
-  sudo zip -r "${BDIR}/files.zip" "$SEL_DOCROOT" >/dev/null
+
+  msg "Archiving files (docroot contents)..."
+  # Zip only the CONTENTS of docroot so restore can target any VHost safely
+  sudo bash -c "cd '$SEL_DOCROOT' && zip -r '$BDIR/files.zip' . >/dev/null"
 
   sudo chown -R "$USER_NAME:$USER_NAME" "$BDIR" || true
   msg "Backup ready at: $BDIR"
+}
+
+# ---------------- Live Log Tailer ----------------
+view_logs() {
+  select_vhost || return 1
+  local LOG_FILE="/var/log/httpd/${SEL_DOMAIN}_error.log"
+
+  if [[ ! -f "$LOG_FILE" ]]; then
+    err "Log file not found: $LOG_FILE"
+    return 1
+  fi
+
+  msg "Tailing logs for domain: ${SEL_DOMAIN}"
+  warn "Press Ctrl+C to stop."
+  sudo tail -n 20 -f "$LOG_FILE"
+}
+
+# ---------------- Smart Restore ----------------
+restore_project() {
+  if [[ ! -d "$BACKUP_BASE" ]]; then
+    err "Backups directory not found: $BACKUP_BASE"
+    return 1
+  fi
+
+  msg "Available backups in: $BACKUP_BASE"
+  local i=1
+  declare -A blist
+  shopt -s nullglob
+  for d in "$BACKUP_BASE"/*/; do
+    echo "$i) $(basename "$d")"
+    blist[$i]="$d"
+    i=$((i+1))
+  done
+  shopt -u nullglob
+
+  if [[ $i -eq 1 ]]; then
+    warn "No backups found."
+    return 1
+  fi
+
+  read -rp "Select backup number to restore: " bchoice
+  local SELECTED_B="${blist[$bchoice]:-}"
+  [[ -z "$SELECTED_B" ]] && { err "Invalid selection."; return 1; }
+
+  msg "Select destination VHost for restore:"
+  select_vhost || return 1
+
+  warn "WARNING: Contents of ${SEL_DOCROOT} will be replaced."
+  read -rp "Continue? (y/N): " CONF
+  CONF="${CONF:-N}"
+  [[ "$CONF" =~ ^[Yy]$ ]] || { msg "Restore cancelled."; return 0; }
+
+  sudo dnf install -y unzip >/dev/null 2>&1 || true
+
+  # Restore files
+  if [[ -f "${SELECTED_B}files.zip" ]]; then
+    msg "Restoring files into: ${SEL_DOCROOT}"
+
+    # Wipe docroot contents safely (including hidden files) without touching the directory itself
+    sudo find "$SEL_DOCROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + >/dev/null 2>&1 || true
+
+    sudo unzip -o "${SELECTED_B}files.zip" -d "$SEL_DOCROOT" >/dev/null
+    msg "Files restored."
+  else
+    err "files.zip not found in backup."
+  fi
+
+  # Restore DB
+  if [[ -f "${SELECTED_B}db.sql" ]]; then
+    read -rp "SQL dump found. Database name to import into: " RDB
+    if [[ -n "$RDB" ]]; then
+      read -rp "DB User (default root): " R_USER
+      R_USER="${R_USER:-root}"
+      read -srp "DB Password (leave empty for socket auth): " R_PASS
+      echo
+
+      msg "Ensuring database exists: $RDB"
+      if [[ -n "$R_PASS" ]]; then
+        sudo mysql -u"$R_USER" -p"$R_PASS" -e "CREATE DATABASE IF NOT EXISTS \`$RDB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        msg "Importing SQL into: $RDB"
+        sudo mysql -u"$R_USER" -p"$R_PASS" "$RDB" < "${SELECTED_B}db.sql"
+      else
+        sudo mysql -u"$R_USER" -e "CREATE DATABASE IF NOT EXISTS \`$RDB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        msg "Importing SQL into: $RDB"
+        sudo mysql -u"$R_USER" "$RDB" < "${SELECTED_B}db.sql"
+      fi
+
+      msg "Database restored."
+    fi
+  else
+    warn "No db.sql found in backup. DB restore skipped."
+  fi
+
+  # Fix permissions after restore
+  apply_web_permissions_tree "$SEL_DOCROOT"
+  msg "Restore completed for VHost: ${SEL_DOMAIN}"
 }
 
 # ============================================================
@@ -396,14 +498,16 @@ backup_project() {
 # ============================================================
 main_menu() {
   while true; do
-    echo -e "\n--- Fedora 43 LAMP DEV (v3.4) ---"
+    echo -e "\n--- Fedora 43 LAMP DEV---"
     echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
     echo "2) Create New VHost"
     echo "3) Issue Self-Signed SSL"
     echo "4) Issue Let's Encrypt SSL"
     echo "5) Backup Project (Files + optional DB)"
-    echo "6) Re-apply permissions on /var/www/html"
-    echo "7) Restart services"
+    echo "6) View Live Error Logs (tail -f)"
+    echo "7) Smart Restore (Files + optional DB)"
+    echo "8) Re-apply permissions on /var/www/html"
+    echo "9) Restart services"
     echo "0) Exit"
     read -rp "Choice: " C
     case "$C" in
@@ -412,8 +516,10 @@ main_menu() {
       3) issue_self_signed_ssl ;;
       4) issue_lets_encrypt_ssl ;;
       5) backup_project ;;
-      6) apply_dev_permissions ;;
-      7) sudo systemctl restart mariadb 2>/dev/null || true; sudo systemctl restart php-fpm 2>/dev/null || true; sudo systemctl restart httpd 2>/dev/null || true; msg "Services restarted." ;;
+      6) view_logs ;;
+      7) restore_project ;;
+      8) apply_dev_permissions ;;
+      9) sudo systemctl restart mariadb 2>/dev/null || true; sudo systemctl restart php-fpm 2>/dev/null || true; sudo systemctl restart httpd 2>/dev/null || true; msg "Services restarted." ;;
       0) exit 0 ;;
       *) err "Invalid choice." ;;
     esac
@@ -425,4 +531,3 @@ require_cmd dnf
 require_cmd sudo
 ask_user
 main_menu
-```
