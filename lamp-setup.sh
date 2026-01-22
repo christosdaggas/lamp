@@ -1,285 +1,428 @@
-#!/bin/bash
-# LAMP + MySQL + DEV full-write on /var/www/html (Fedora 42)
-# WITH PHP VERSION SELECT + site fixers + restart/uninstall options
+```bash
+#!/usr/bin/env bash
+# Fedora 43 - LAMP DEV Installer (v3.4)
+# Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt, SELinux+ACL perms,
+# Self-Signed SSL, Let's Encrypt SSL, Project backups (files + optional DB dump)
 set -euo pipefail
 
-# Ask for username, default to current logged in user
-DEFAULT_USER=$(whoami)
-read -rp "👤 Enter the Linux username to set permissions for [${DEFAULT_USER}]: " USER_NAME
-USER_NAME=${USER_NAME:-$DEFAULT_USER}
+# Path Variables
+WEB_DIR="/var/www/html"
+VHOST_PREFIX="/etc/httpd/conf.d/20-"
+SSL_CERT_DIR="/etc/pki/tls/certs"
+SSL_KEY_DIR="/etc/pki/tls/private"
 
-WEB_DIR=/var/www/html
-REMIREPO_RPM="https://rpms.remirepo.net/fedora/remi-release-42.rpm"
+# Config Files
+APACHE_BASE_CONF="/etc/httpd/conf.d/10-www.conf"
+APACHE_PHPFPM_HANDLER_CONF="/etc/httpd/conf.d/15-php-fpm.conf"
+PHP_DEV_INI="/etc/php.d/99-dev-prestashop.ini"
+PHPFPM_POOL_CONF="/etc/php-fpm.d/www.conf"
+MYSQL_REMOTE_CONF="/etc/my.cnf.d/60-remote.cnf"
 
-msg(){ echo -e "\033[1;32m$*\033[0m"; }
-warn(){ echo -e "\033[1;33m$*\033[0m"; }
-err(){ echo -e "\033[1;31m$*\033[0m"; }
+# State (selected vhost)
+SEL_DOMAIN=""
+SEL_DOCROOT=""
+SEL_CONF=""
 
-select_php_version() {
-  echo ""
-  echo "🧠 Select PHP version (Remi stream):"
-  echo "1) PHP 8.1"
-  echo "2) PHP 8.2"
-  echo "3) PHP 8.3"
-  echo "4) PHP 8.4"
-  read -rp "📌 Selection (1–4): " PHP_CHOICE
-  case "$PHP_CHOICE" in
-    1) PHP_VERSION="8.1" ;;
-    2) PHP_VERSION="8.2" ;;
-    3) PHP_VERSION="8.3" ;;
-    4) PHP_VERSION="8.4" ;;
-    *) err "❌ Invalid selection."; exit 1 ;;
-  esac
-  msg "📥 Adding Remi repo (Fedora 42) + enabling php:remi-${PHP_VERSION}…"
-  sudo dnf install -y "$REMIREPO_RPM"
-  sudo dnf module -y reset php
-  sudo dnf module -y enable php:remi-${PHP_VERSION}
+# Message helpers
+msg(){ echo -e "\033[1;32m[INFO] $*\033[0m"; }
+warn(){ echo -e "\033[1;33m[WARN] $*\033[0m"; }
+err(){ echo -e "\033[1;31m[ERROR] $*\033[0m"; }
+
+# ============================================================
+# SYSTEM HELPERS
+# ============================================================
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
+getenforce_safe(){ command -v getenforce >/dev/null 2>&1 && getenforce || echo "Disabled"; }
+apache_configtest(){ sudo apachectl configtest; }
+safe_reload_httpd(){ apache_configtest; sudo systemctl reload httpd; }
+
+ask_user() {
+  local default_user
+  default_user="$(whoami)"
+  read -rp "Linux username for DEV permissions [${default_user}]: " USER_NAME
+  USER_NAME="${USER_NAME:-$default_user}"
+  id "$USER_NAME" >/dev/null 2>&1 || { err "User '${USER_NAME}' does not exist."; exit 1; }
+  msg "DEV user: ${USER_NAME}"
 }
 
-install_lamp_stack() {
-  msg "📦 Updating system packages..."
+open_firewall_service() {
+  local svc="$1"
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    sudo firewall-cmd --add-service="$svc" --permanent >/dev/null 2>&1 || true
+    sudo firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+open_firewall_port() {
+  local port="$1"
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    sudo firewall-cmd --add-port="$port" --permanent >/dev/null 2>&1 || true
+    sudo firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+# ============================================================
+# SAFE /etc/hosts MANAGEMENT
+# ============================================================
+manage_hosts_entry() {
+  local action="$1" domain="$2"
+  case "$action" in
+    add)
+      if grep -Eq "^[[:space:]]*127\.0\.0\.1[[:space:]].*([[:space:]]|^)${domain}([[:space:]]|\$)" /etc/hosts; then
+        warn "Domain $domain already exists in /etc/hosts"
+      else
+        echo "127.0.0.1 $domain" | sudo tee -a /etc/hosts >/dev/null
+        msg "Added $domain to /etc/hosts"
+      fi
+      ;;
+    remove)
+      local tmp
+      tmp="$(mktemp)"
+      sudo awk -v d="$domain" '
+        BEGIN { OFS="\t" }
+        /^[[:space:]]*#/ { print; next }
+        /^[[:space:]]*$/ { print; next }
+        {
+          ip=$1; n=0
+          for (i=2; i<=NF; i++) if ($i != d) names[++n]=$i
+          if (n==0) next
+          printf "%s", ip
+          for (j=1; j<=n; j++) printf "%s%s", OFS, names[j]
+          printf "\n"
+          for (k=1; k<=n; k++) delete names[k]
+        }
+      ' /etc/hosts | sudo tee "$tmp" >/dev/null
+      sudo cp "$tmp" /etc/hosts
+      sudo rm -f "$tmp"
+      msg "Removed $domain from /etc/hosts"
+      ;;
+    *)
+      err "manage_hosts_entry: unknown action '$action'"
+      return 1
+      ;;
+  esac
+}
+
+# ============================================================
+# INSTALLATION CORE
+# ============================================================
+install_apache_php() {
+  msg "Installing Apache + PHP-FPM + OpenSSL..."
   sudo dnf upgrade --refresh -y
+  sudo dnf install -y httpd mod_http2 mod_ssl openssl
 
-  msg "🌐 Installing Apache..."
-  sudo dnf install -y httpd mod_http2
-  sudo systemctl enable --now httpd
+  # Ensure proxy modules for PHP-FPM handler
+  if ! sudo httpd -M 2>/dev/null | grep -q proxy_fcgi_module; then
+    sudo bash -c 'cat >/etc/httpd/conf.modules.d/99-proxy-fcgi.conf' <<'EOF'
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+EOF
+  fi
 
-  select_php_version
+  # PrestaShop-friendly PHP modules
+  sudo dnf install -y \
+    php php-fpm php-cli php-common \
+    php-mysqlnd php-zip php-devel \
+    php-gd php-mbstring php-curl php-xml \
+    php-bcmath php-intl php-opcache
 
-  msg "🧩 Installing PHP ${PHP_VERSION} (FPM) + common extensions…"
-  sudo dnf install -y php php-fpm php-cli php-mysqlnd php-zip php-devel \
-    php-gd php-mbstring php-curl php-xml php-bcmath php-json php-intl php-fileinfo php-opcache
-  sudo systemctl enable --now php-fpm
+  open_firewall_service http
+  open_firewall_service https
 
-  msg "🗄️ Installing MariaDB..."
-  sudo dnf install -y mariadb-server
-  sudo systemctl enable --now mariadb
-
-  msg "🔐 Running mysql_secure_installation (interactive)…"
-  sudo mysql_secure_installation || true
-
-  msg "🧱 Opening firewall ports (HTTP/HTTPS)…"
-  sudo firewall-cmd --add-service=http --permanent || true
-  sudo firewall-cmd --add-service=https --permanent || true
-  sudo firewall-cmd --reload || true
-
-  msg "🔧 Apache base (.htaccess + index + ServerName)…"
-  sudo bash -c 'cat >/etc/httpd/conf.d/10-www.conf' <<'EOF'
+  # Apache base config
+  sudo bash -c "cat >'${APACHE_BASE_CONF}'" <<'EOF'
 ServerName localhost
 <Directory "/var/www/html">
-    AllowOverride All
-    Require all granted
-    DirectoryIndex index.php index.html
+  AllowOverride All
+  Require all granted
+  DirectoryIndex index.php index.html
 </Directory>
 EOF
 
-  # Dev networking booleans (API/DB over TCP)
-  sudo setsebool -P httpd_can_network_connect 1
-  sudo setsebool -P httpd_can_network_connect_db 1
+  # PHP-FPM socket config
+  sudo sed -i \
+    -e 's~^;*listen\s*=.*~listen = /run/php-fpm/www.sock~' \
+    -e 's~^;*listen\.owner\s*=.*~listen.owner = apache~' \
+    -e 's~^;*listen\.group\s*=.*~listen.group = apache~' \
+    -e 's~^;*listen\.mode\s*=.*~listen.mode = 0660~' \
+    "${PHPFPM_POOL_CONF}"
 
-  # Dev php.ini to surface errors
-  sudo mkdir -p /etc/php.d
-  sudo bash -c 'cat >/etc/php.d/99-dev.ini' <<'EOF'
+  # Apache handler for PHP
+  sudo bash -c "cat >'${APACHE_PHPFPM_HANDLER_CONF}'" <<'EOF'
+<FilesMatch \.php$>
+  SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
+</FilesMatch>
+EOF
+
+  # PHP dev ini
+  sudo bash -c "cat >'${PHP_DEV_INI}'" <<'EOF'
 display_errors=On
 display_startup_errors=On
 error_reporting=E_ALL
 log_errors=On
 memory_limit=512M
-max_execution_time=180
+max_execution_time=300
+max_input_time=300
+max_input_vars=10000
+upload_max_filesize=256M
+post_max_size=256M
+date.timezone=Europe/Athens
 EOF
 
-  # Ensure mod_rewrite is loaded
-  if ! sudo httpd -M 2>/dev/null | grep -q rewrite_module; then
-    echo "LoadModule rewrite_module modules/mod_rewrite.so" \
-      | sudo tee /etc/httpd/conf.modules.d/99-rewrite.conf >/dev/null
+  # SELinux booleans for dev networking
+  if [[ "$(getenforce_safe)" != "Disabled" ]]; then
+    sudo setsebool -P httpd_can_network_connect 1 || true
+    sudo setsebool -P httpd_can_network_connect_db 1 || true
   fi
 
-  msg "✅ LAMP installed (Apache + PHP-FPM ${PHP_VERSION} + MariaDB)."
+  apache_configtest
+  sudo systemctl enable --now php-fpm httpd
+  sudo systemctl restart php-fpm httpd
+
+  msg "PHP version: $(php -v | head -n 1)"
 }
 
-setup_mysql() {
-  read -rp "👤 Enter MySQL username: " ADMIN_USER
-  read -srp "🔑 Enter password for ${ADMIN_USER}: " ADMIN_PASS; echo
-  read -rp "🗃️ Enter database name: " ADMIN_DB
+install_mariadb_dev() {
+  warn "DEV ONLY: MariaDB remote access is enabled (bind 0.0.0.0)."
+  msg "Installing MariaDB..."
+  sudo dnf install -y mariadb-server
+  sudo systemctl enable --now mariadb
 
-  msg "🛠 Creating MySQL DB & user (idempotent)…"
-  sudo mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`${ADMIN_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    CREATE USER IF NOT EXISTS '${ADMIN_USER}'@'localhost' IDENTIFIED BY '${ADMIN_PASS}';
-    GRANT ALL PRIVILEGES ON \`${ADMIN_DB}\`.* TO '${ADMIN_USER}'@'localhost';
-    FLUSH PRIVILEGES;"
-  msg "✅ MySQL user and DB ready."
+  sudo bash -c "cat >'${MYSQL_REMOTE_CONF}'" <<'EOF'
+[mysqld]
+bind-address = 0.0.0.0
+skip-networking = 0
+EOF
+
+  sudo systemctl restart mariadb
+
+  # Deterministic: open the port, do not rely on service name
+  open_firewall_port 3306/tcp
 }
 
-dev_html_fullwrite() {
-  msg "🧰 Installing tools (ACL + SELinux utils)…"
-  sudo dnf -y install acl policycoreutils-python-utils >/dev/null
+# ============================================================
+# PERMISSIONS (ONLY inside WEB_DIR)
+# ============================================================
+apply_web_permissions_tree() {
+  local target="${1:-$WEB_DIR}"
+  sudo dnf -y install acl policycoreutils-python-utils >/dev/null 2>&1
 
-  msg "👥 Ensure $USER_NAME is in group 'apache'…"
   if ! id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx apache; then
     sudo usermod -aG apache "$USER_NAME"
-    warn "👉 Logout/Login after script so group applies."
+    warn "User added to group apache. Logout/login recommended."
   fi
 
-  msg "📂 POSIX ownership & modes on ${WEB_DIR}…"
-  sudo chown -R "${USER_NAME}:apache" "${WEB_DIR}"
-  sudo find "${WEB_DIR}" -type d -exec chmod 2775 {} \;
-  sudo find "${WEB_DIR}" -type f -exec chmod 0664 {} \;
-
-  msg "🧬 ACLs (runtime + defaults)…"
-  sudo setfacl -R -m u:${USER_NAME}:rwx,g:apache:rwx "${WEB_DIR}"
-  sudo setfacl -d -m u:${USER_NAME}:rwx,g:apache:rwX "${WEB_DIR}"
-
-  msg "🔒 SELinux: make ALL of ${WEB_DIR} writable by Apache (DEV)…"
-  sudo semanage fcontext -a -t httpd_sys_rw_content_t "${WEB_DIR}(/.*)?"
-  sudo restorecon -Rv "${WEB_DIR}" >/dev/null
-
-  # PHP temp dirs sanity
-  if [ -d /var/lib/php ]; then
-    sudo chgrp -R apache /var/lib/php || true
-    sudo chmod -R 0775 /var/lib/php || true
-    sudo restorecon -Rv /var/lib/php >/dev/null || true
+  # Ensure web root base ownership + setgid
+  if [[ "$target" == "$WEB_DIR" ]]; then
+    sudo chown root:apache "$WEB_DIR"
+    sudo chmod 2775 "$WEB_DIR"
   fi
 
-  # Quick test page
-  echo '<?php phpinfo();' | sudo tee ${WEB_DIR}/info.php >/dev/null
+  sudo chgrp -R apache "$target"
+  sudo find "$target" -type d -exec chmod 2775 {} \;
+  sudo find "$target" -type f -exec chmod 0664 {} \;
+  sudo setfacl -R -m "u:${USER_NAME}:rwX,g:apache:rwX,m:rwX" "$target"
+  sudo find "$target" -type d -exec setfacl -m "d:u:${USER_NAME}:rwx,d:g:apache:rwx,d:m:rwx" {} \;
 
-  sudo systemctl restart php-fpm httpd
-  msg "✅ DEV mode ready."
+  if [[ "$(getenforce_safe)" != "Disabled" ]]; then
+    sudo semanage fcontext -a -t httpd_sys_rw_content_t "${WEB_DIR}(/.*)?" 2>/dev/null \
+      || sudo semanage fcontext -m -t httpd_sys_rw_content_t "${WEB_DIR}(/.*)?"
+    sudo restorecon -Rv "$target" >/dev/null 2>&1 || true
+  fi
 }
 
-fix_site() {
-  read -rp "Site folder name under ${WEB_DIR} (e.g., prestashop): " SITE
-  local SITE_DIR="${WEB_DIR}/${SITE}"
-  [ -d "$SITE_DIR" ] || { err "No such dir: $SITE_DIR"; return 1; }
+apply_dev_permissions() {
+  apply_web_permissions_tree "$WEB_DIR"
 
-  msg "🔧 Fixing ONE site: ${SITE_DIR}"
-  sudo chown -R "${USER_NAME}:apache" "$SITE_DIR"
-  sudo find "$SITE_DIR" -type d -exec chmod 2775 {} \;
-  sudo find "$SITE_DIR" -type f -exec chmod 0664 {} \;
-  sudo setfacl -R -m u:${USER_NAME}:rwx,g:apache:rwx "$SITE_DIR"
-  sudo setfacl -d -m u:${USER_NAME}:rwx,g:apache:rwX "$SITE_DIR"
-  sudo restorecon -Rv "$SITE_DIR" >/dev/null
-  msg "✅ Fixed ${SITE_DIR}"
-}
-
-fix_all_sites() {
-  msg "🧰 Fixing ALL first-level folders under ${WEB_DIR}…"
-  for d in "${WEB_DIR}"/*; do
-    [ -d "$d" ] || continue
-    sudo chown -R "${USER_NAME}:apache" "$d"
-    sudo find "$d" -type d -exec chmod 2775 {} \;
-    sudo find "$d" -type f -exec chmod 0664 {} \;
-    sudo setfacl -R -m u:${USER_NAME}:rwx,g:apache:rwx "$d"
-    sudo setfacl -d -m u:${USER_NAME}:rwx,g:apache:rwX "$d"
-    sudo restorecon -Rv "$d" >/dev/null
-    echo "✔ $d"
+  # systemd UMask for service-created files (no global shell umask)
+  for svc in httpd php-fpm; do
+    local dir="/etc/systemd/system/${svc}.service.d"
+    sudo mkdir -p "$dir"
+    echo -e "[Service]\nUMask=0002" | sudo tee "${dir}/override.conf" >/dev/null
   done
-  msg "✅ All sites fixed."
+
+  sudo systemctl daemon-reload
+  sudo systemctl restart php-fpm httpd
+
+  # quick test page
+  echo '<?php phpinfo();' | sudo tee "${WEB_DIR}/info.php" >/dev/null
 }
 
-make_info() {
-  echo '<?php phpinfo();' | sudo tee ${WEB_DIR}/info.php >/dev/null
-  msg "ℹ️  Test at: http://localhost/info.php"
+# ============================================================
+# VHOSTS
+# ============================================================
+create_vhost() {
+  read -rp "Domain (e.g. project.local): " VHOST
+  read -rp "Folder in /var/www/html/: " FOLDER
+  local DOCROOT="${WEB_DIR}/${FOLDER}"
+  local CONF="${VHOST_PREFIX}${VHOST}.conf"
+
+  sudo mkdir -p "$DOCROOT"
+
+  # Variable expansion required here
+  sudo bash -c "cat >'${CONF}'" <<EOF
+<VirtualHost *:80>
+  ServerName ${VHOST}
+  DocumentRoot ${DOCROOT}
+  <Directory ${DOCROOT}>
+    AllowOverride All
+    Require all granted
+  </Directory>
+</VirtualHost>
+EOF
+
+  safe_reload_httpd
+  apply_web_permissions_tree "$DOCROOT"
+
+  read -rp "Add /etc/hosts entry for ${VHOST} -> 127.0.0.1? (y/N): " ADDH
+  ADDH="${ADDH:-N}"
+  [[ "$ADDH" =~ ^[Yy]$ ]] && manage_hosts_entry add "$VHOST"
+
+  msg "VHost ready: http://${VHOST}/ -> ${DOCROOT}"
 }
 
-restart_services() {
-  msg "🔄 Restarting Apache & PHP-FPM…"
-  sudo systemctl restart httpd
-  sudo systemctl restart php-fpm
-  msg "✅ Services restarted."
+select_vhost() {
+  shopt -s nullglob
+  local files=(${VHOST_PREFIX}*.conf)
+  [[ ${#files[@]} -eq 0 ]] && { err "No VHosts found."; return 1; }
+
+  echo "Select VHost:"
+  local i=1
+  declare -A list
+  for f in "${files[@]}"; do
+    local d
+    d="$(sudo awk '/^[[:space:]]*ServerName[[:space:]]+/ {print $2; exit}' "$f")"
+    echo "$i) $d"
+    list[$i]="$d|$f"
+    i=$((i+1))
+  done
+
+  read -rp "Choice: " choice
+  [[ -z "${list[$choice]:-}" ]] && return 1
+
+  IFS='|' read -r SEL_DOMAIN SEL_CONF <<< "${list[$choice]}"
+  SEL_DOCROOT="$(sudo awk '/^[[:space:]]*DocumentRoot[[:space:]]+/ {print $2; exit}' "$SEL_CONF")"
 }
 
-uninstall_apache() {
-  msg "🛑 Uninstalling Apache only…"
-  sudo systemctl disable --now httpd || true
-  sudo dnf remove -y httpd mod_http2 || true
-  msg "✅ Apache removed."
-}
+# ============================================================
+# SSL (Self-signed + Let's Encrypt)
+# ============================================================
+issue_self_signed_ssl() {
+  select_vhost || return 1
 
-uninstall_php() {
-  msg "🛑 Uninstalling PHP-FPM and common extensions…"
-  sudo systemctl disable --now php-fpm || true
-  sudo dnf remove -y php php-fpm php-cli php-mysqlnd php-zip php-devel \
-    php-gd php-mbstring php-curl php-xml php-bcmath php-json php-intl \
-    php-fileinfo php-opcache || true
-  msg "✅ PHP removed."
-}
+  sudo mkdir -p "$SSL_CERT_DIR" "$SSL_KEY_DIR"
+  sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout "${SSL_KEY_DIR}/${SEL_DOMAIN}.key" \
+    -out "${SSL_CERT_DIR}/${SEL_DOMAIN}.crt" \
+    -subj "/CN=${SEL_DOMAIN}"
 
-uninstall_mariadb() {
-  warn "This will remove MariaDB server packages (data stays unless you delete /var/lib/mysql)."
-  read -rp "📦 Backup /var/lib/mysql before uninstall? (y/N): " BACKUP
-  if [[ "${BACKUP}" =~ ^[Yy]$ ]]; then
-    local BACKUP_DIR=~/Documents/mysql_backup_$(date +%F_%H%M%S)
-    mkdir -p "${BACKUP_DIR}"
-    sudo cp -r /var/lib/mysql "${BACKUP_DIR}"
-    sudo chown -R "${USER}:${USER}" "${BACKUP_DIR}" || true
-    msg "✅ Databases backed up to ${BACKUP_DIR}"
+  if ! sudo grep -qE "<VirtualHost[[:space:]]+\*:443>" "$SEL_CONF"; then
+    sudo bash -c "cat >>'${SEL_CONF}'" <<EOF
+
+<VirtualHost *:443>
+  ServerName ${SEL_DOMAIN}
+  DocumentRoot ${SEL_DOCROOT}
+  SSLEngine on
+  SSLCertificateFile ${SSL_CERT_DIR}/${SEL_DOMAIN}.crt
+  SSLCertificateKeyFile ${SSL_KEY_DIR}/${SEL_DOMAIN}.key
+  Protocols h2 http/1.1
+  <Directory ${SEL_DOCROOT}>
+    AllowOverride All
+    Require all granted
+  </Directory>
+</VirtualHost>
+EOF
   fi
-  sudo systemctl disable --now mariadb || true
-  sudo dnf remove -y mariadb-server mariadb mariadb-libs || true
-  msg "✅ MariaDB removed."
+
+  safe_reload_httpd
+  msg "Self-signed SSL ready: https://${SEL_DOMAIN}/"
 }
 
-uninstall_lamp() {
-  warn "⚠️ This will remove Apache, PHP-FPM, and MariaDB."
-  read -rp "Type 'YES' to confirm: " CONFIRM
-  [[ "${CONFIRM}" == "YES" ]] || { err "Cancelled."; return; }
+issue_lets_encrypt_ssl() {
+  warn "Let's Encrypt HTTP-01 requires public DNS and port 80 reachable from the internet."
+  open_firewall_service http
+  open_firewall_service https
 
-  uninstall_apache
-  uninstall_php
-  uninstall_mariadb
+  sudo dnf install -y certbot python3-certbot-apache mod_ssl
 
-  read -rp "Also purge ${WEB_DIR} contents? (y/N): " PURGE
-  if [[ "${PURGE}" =~ ^[Yy]$ ]]; then
-    sudo rm -rf "${WEB_DIR:?}/"* || true
-    sudo restorecon -Rv "${WEB_DIR}" >/dev/null || true
-    msg "🧹 ${WEB_DIR} cleaned."
+  select_vhost || return 1
+
+  read -rp "Email for Let's Encrypt: " EM
+  [[ -n "$EM" ]] || { err "Email is required."; return 1; }
+
+  sudo certbot --apache -d "$SEL_DOMAIN" -m "$EM" \
+    --agree-tos --non-interactive --redirect
+
+  msg "Let's Encrypt SSL ready: https://${SEL_DOMAIN}/"
+}
+
+# ============================================================
+# BACKUP (Files + optional DB dump)
+# ============================================================
+backup_project() {
+  select_vhost || return 1
+
+  local TS BDIR
+  TS="$(date +%Y%m%d_%H%M%S)"
+  BDIR="$HOME/lamp_backups/${SEL_DOMAIN}_${TS}"
+  mkdir -p "$BDIR"
+
+  read -rp "Database name (leave empty to skip DB export): " DB_NAME
+  if [[ -n "$DB_NAME" ]]; then
+    read -rp "DB User (default root): " DBU
+    DBU="${DBU:-root}"
+    read -srp "DB Password (leave empty for socket auth): " DBP
+    echo
+
+    msg "Exporting database..."
+    if [[ -n "$DBP" ]]; then
+      sudo mysqldump -u"$DBU" -p"$DBP" --databases "$DB_NAME" > "${BDIR}/db.sql"
+    else
+      sudo mysqldump -u"$DBU" --databases "$DB_NAME" > "${BDIR}/db.sql"
+    fi
+  else
+    warn "DB export skipped."
   fi
 
-  msg "🔒 Closing firewall ports…"
-  sudo firewall-cmd --remove-service=http --permanent || true
-  sudo firewall-cmd --remove-service=https --permanent || true
-  sudo firewall-cmd --reload || true
+  sudo dnf install -y zip >/dev/null 2>&1 || true
+  sudo zip -r "${BDIR}/files.zip" "$SEL_DOCROOT" >/dev/null
 
-  msg "✅ Full LAMP uninstall complete."
+  sudo chown -R "$USER_NAME:$USER_NAME" "$BDIR" || true
+  msg "Backup ready at: $BDIR"
 }
 
-# ---------------- MENU ----------------
-while true; do
-  echo ""
-  echo "=============================="
-  echo "  LAMP DEV SETUP (Fedora 42)  "
-  echo "=============================="
-  echo "1) Install LAMP Stack (select PHP version via Remi)"
-  echo "2) Setup MySQL User & Database"
-  echo "3) Apply DEV full-write on ${WEB_DIR} (POSIX+ACL+SELinux)"
-  echo "4) Do 1 + 2 + 3 (one shot)"
-  echo "5) Fix ONE site under ${WEB_DIR} (e.g. prestashop)"
-  echo "6) Fix ALL sites under ${WEB_DIR}"
-  echo "7) Create phpinfo() at ${WEB_DIR}/info.php"
-  echo "8) Restart Apache & PHP-FPM"
-  echo "9) Uninstall Apache Only"
-  echo "10) Uninstall PHP Only"
-  echo "11) Uninstall MariaDB (with optional DB backup)"
-  echo "12) Uninstall Everything (Full LAMP Reset)"
-  echo "0) Exit"
-  echo "=============================="
-  read -rp "Choose: " CHOICE
+# ============================================================
+# MENU
+# ============================================================
+main_menu() {
+  while true; do
+    echo -e "\n--- Fedora 43 LAMP DEV (v3.4) ---"
+    echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
+    echo "2) Create New VHost"
+    echo "3) Issue Self-Signed SSL"
+    echo "4) Issue Let's Encrypt SSL"
+    echo "5) Backup Project (Files + optional DB)"
+    echo "6) Re-apply permissions on /var/www/html"
+    echo "7) Restart services"
+    echo "0) Exit"
+    read -rp "Choice: " C
+    case "$C" in
+      1) install_apache_php; install_mariadb_dev; apply_dev_permissions ;;
+      2) create_vhost ;;
+      3) issue_self_signed_ssl ;;
+      4) issue_lets_encrypt_ssl ;;
+      5) backup_project ;;
+      6) apply_dev_permissions ;;
+      7) sudo systemctl restart mariadb 2>/dev/null || true; sudo systemctl restart php-fpm 2>/dev/null || true; sudo systemctl restart httpd 2>/dev/null || true; msg "Services restarted." ;;
+      0) exit 0 ;;
+      *) err "Invalid choice." ;;
+    esac
+  done
+}
 
-  case "$CHOICE" in
-    1) install_lamp_stack ;;
-    2) setup_mysql ;;
-    3) dev_html_fullwrite ;;
-    4) install_lamp_stack; setup_mysql; dev_html_fullwrite; make_info ;;
-    5) fix_site ;;
-    6) fix_all_sites ;;
-    7) make_info ;;
-    8) restart_services ;;
-    9) uninstall_apache ;;
-    10) uninstall_php ;;
-    11) uninstall_mariadb ;;
-    12) uninstall_lamp ;;
-    0) echo "👋 Bye."; exit 0 ;;
-    *) err "❌ Invalid option." ;;
-  esac
-done
+# Entry
+require_cmd dnf
+require_cmd sudo
+ask_user
+main_menu
+```
