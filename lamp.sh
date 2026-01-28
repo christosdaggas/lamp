@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fedora 43 - LAMP DEV Manager (v3.7 - MariaDB init + DB create option)
+# Fedora 43 - LAMP DEV Manager
 # Includes: Apache, PHP-FPM, MariaDB (remote enabled), VHosts, /etc/hosts mgmt,
-# ACL+SELinux permissions, Self-Signed SSL, Let's Encrypt SSL, Backup/Restore, Live Log Tailer
+# ACL+SELinux permissions (DEV MODE), Self-Signed SSL, Let's Encrypt SSL, Backup/Restore
 
 set -euo pipefail
 
@@ -198,8 +198,12 @@ date.timezone=Europe/Athens
 EOF
 
   if [[ "$(getenforce_safe)" != "Disabled" ]]; then
+    # Standard booleans
     sudo setsebool -P httpd_can_network_connect 1 || true
     sudo setsebool -P httpd_can_network_connect_db 1 || true
+    # DEV MODE MAGIC: Allow httpd full R/W access irrespective of type
+    sudo setsebool -P httpd_unified 1 || true
+    msg "SELinux: Enabled httpd_unified (Dev Mode Read/Write)"
   fi
 
   apache_configtest
@@ -225,14 +229,8 @@ EOF
   open_firewall_port 3306/tcp
 }
 
-# ============================================================
-# NEW: MariaDB init + create database/user
-# ============================================================
 ensure_mariadb_initialized() {
-  # Ensure datadir exists and is initialized. Most Fedora installs do this automatically,
-  # but this makes it explicit and safe for edge cases.
   local datadir="/var/lib/mysql"
-
   sudo mkdir -p "$datadir"
   if [[ ! -d "${datadir}/mysql" ]] || [[ -z "$(sudo ls -A "${datadir}/mysql" 2>/dev/null || true)" ]]; then
     warn "MariaDB datadir appears uninitialized. Initializing..."
@@ -250,7 +248,6 @@ ensure_mariadb_initialized() {
 mariadb_init_and_create_db() {
   msg "Initializing MariaDB (if needed) and creating database/user..."
 
-  # Ensure MariaDB is installed/running
   if ! rpm -q mariadb-server >/dev/null 2>&1; then
     install_mariadb_dev
   else
@@ -260,14 +257,12 @@ mariadb_init_and_create_db() {
   ensure_mariadb_initialized
   sudo systemctl restart mariadb
 
-  # Optional secure wizard (interactive)
   read -rp "Run mysql_secure_installation now? (y/N): " SEC
   SEC="${SEC:-N}"
   if [[ "$SEC" =~ ^[Yy]$ ]]; then
     sudo mysql_secure_installation || true
   fi
 
-  # Create DB + user
   read -rp "Database name (e.g. prestashop_db): " DB_NAME
   [[ -n "$DB_NAME" ]] || { err "Database name is required."; return 1; }
 
@@ -292,43 +287,78 @@ GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';
 $( [[ "$ALLOW_CREATE" =~ ^[Yy]$ ]] && echo "GRANT CREATE, DROP ON *.* TO '${DB_USER}'@'${DB_HOST}';" )
 FLUSH PRIVILEGES;
 SQL
-
   msg "MariaDB initialized. DB/user created successfully."
 }
 
 # ============================================================
-# PERMISSIONS (ONLY inside WEB_DIR)
+# PERMISSIONS (REWRITTEN FOR PURE DEV MODE)
 # ============================================================
 apply_web_permissions_tree() {
   local target="${1:-$WEB_DIR}"
+  
+  msg "Applying AGGRESSIVE DEV permissions on: $target"
+  
+  # Ensure tools exist
   sudo dnf -y install acl policycoreutils-python-utils >/dev/null 2>&1
 
+  # 1. Add User to Group Apache (Ensure membership)
   if ! id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx apache; then
     sudo usermod -aG apache "$USER_NAME"
-    warn "User added to group apache. Logout/login recommended."
+    warn "User added to group apache. Please LOGOUT and LOGIN again for this to take full effect!"
   fi
 
-  if [[ "$target" == "$WEB_DIR" ]]; then
-    sudo chown root:apache "$WEB_DIR"
-    sudo chmod 2775 "$WEB_DIR"
-  fi
+  # 2. Set Ownership: User is Owner, Apache is Group
+  # This ensures YOU always own the files.
+  sudo chown -R "${USER_NAME}:apache" "$target"
 
-  sudo chgrp -R apache "$target"
+  # 3. Set Base Permissions with Sticky Bit (SGID)
+  # SGID (g+s) ensures new files created by you or apache inherit the 'apache' group.
   sudo find "$target" -type d -exec chmod 2775 {} \;
   sudo find "$target" -type f -exec chmod 0664 {} \;
-  sudo setfacl -R -m "u:${USER_NAME}:rwX,g:apache:rwX,m:rwX" "$target"
-  sudo find "$target" -type d -exec setfacl -m "d:u:${USER_NAME}:rwx,d:g:apache:rwx,d:m:rwx" {} \;
 
+  # 4. Apply ACLs (Access Control Lists)
+  # -m: Modify current permissions
+  # -d: Set DEFAULT permissions (for future files)
+  # We give RWX to User and RWX to Group for everything.
+  msg "Setting ACLs (Default + Current)..."
+  
+  # Clear existing ACLs first to avoid clutter
+  sudo setfacl -R -b "$target"
+  
+  # Apply new ACLs:
+  # u::rwx -> Owner has RWX
+  # g::rwx -> Group has RWX
+  # o::rx  -> Others read-only
+  # u:${USER_NAME}:rwx -> Explicitly ensure user has RWX
+  # g:apache:rwx -> Explicitly ensure apache has RWX
+  # m::rwx -> Mask allows max perms
+  
+  # Recursive for current files
+  sudo setfacl -R -m u::rwx,g::rwx,o::rx,u:"${USER_NAME}":rwx,g:apache:rwx,m::rwx "$target"
+  
+  # Default for FUTURE files (Directories only)
+  sudo find "$target" -type d -exec setfacl -m d:u::rwx,d:g::rwx,d:o::rx,d:u:"${USER_NAME}":rwx,d:g:apache:rwx,d:m::rwx {} \;
+
+  # 5. SELinux "Nuclear Option" for Dev
   if [[ "$(getenforce_safe)" != "Disabled" ]]; then
+    msg "SELinux: Ensuring httpd_unified is ON (Write Anywhere)"
+    sudo setsebool -P httpd_unified 1 2>/dev/null || true
+    
+    # Still set the context just in case unified is off later
     sudo semanage fcontext -a -t httpd_sys_rw_content_t "${WEB_DIR}(/.*)?" 2>/dev/null \
       || sudo semanage fcontext -m -t httpd_sys_rw_content_t "${WEB_DIR}(/.*)?"
+    
+    # Restore context (silently)
     sudo restorecon -Rv "$target" >/dev/null 2>&1 || true
   fi
+
+  msg "Permissions fixed. You and Apache now have full R/W access."
 }
 
 apply_dev_permissions() {
   apply_web_permissions_tree "$WEB_DIR"
 
+  # Ensure UMask is 0002 for services so they write group-writable files by default
   for svc in httpd php-fpm; do
     local dir="/etc/systemd/system/${svc}.service.d"
     sudo mkdir -p "$dir"
@@ -338,7 +368,9 @@ apply_dev_permissions() {
   sudo systemctl daemon-reload
   sudo systemctl restart php-fpm httpd
 
-  echo '<?php phpinfo();' | sudo tee "${WEB_DIR}/info.php" >/dev/null
+  if [[ ! -f "${WEB_DIR}/info.php" ]]; then
+      echo '<?php phpinfo();' | sudo tee "${WEB_DIR}/info.php" >/dev/null
+  fi
 }
 
 # ============================================================
@@ -351,6 +383,11 @@ create_vhost() {
   local CONF="${VHOST_PREFIX}${VHOST}.conf"
 
   sudo mkdir -p "$DOCROOT"
+  
+  # Apply permissions immediately to the new folder
+  # We set ownership to user immediately so you can upload files right away
+  sudo chown "${USER_NAME}:apache" "$DOCROOT"
+  sudo chmod 2775 "$DOCROOT"
 
   sudo bash -c "cat >'${CONF}'" <<EOF
 <VirtualHost *:80>
@@ -366,6 +403,8 @@ create_vhost() {
 EOF
 
   safe_reload_httpd
+  
+  # Run the full permission tree fix on this folder to ensure ACLs/Defaults are set
   apply_web_permissions_tree "$DOCROOT"
 
   read -rp "Add /etc/hosts entry for ${VHOST} -> 127.0.0.1? (y/N): " ADDH
@@ -576,6 +615,7 @@ restore_project() {
     warn "No db.sql found in backup. DB restore skipped."
   fi
 
+  # Apply the DEV permissions again after restore to fix any bad zip attributes
   apply_web_permissions_tree "$SEL_DOCROOT"
   msg "Restore completed for VHost: ${SEL_DOMAIN}"
 }
@@ -585,7 +625,7 @@ restore_project() {
 # ============================================================
 main_menu() {
   while true; do
-    echo -e "\n--- Fedora 43 LAMP DEV (v3.7) ---"
+    echo -e "\n--- Fedora 43 LAMP DEV (v3.8 - DEV PERMS) ---"
     echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
     echo "2) Create New VHost"
     echo "3) Issue Self-Signed SSL"
