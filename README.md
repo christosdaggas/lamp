@@ -9,8 +9,8 @@ This script provides an interactive way to install and manage a developer-focuse
 
 ```bash
 cd ~/Downloads
-chmod +x lamp-setup.sh
-./lamp-setup.sh | tee lamp-log.txt
+chmod +x lamp.sh
+./lamp.sh | tee lamp-log.txt
 ```
 
 Logs will be written to `lamp-log.txt`.
