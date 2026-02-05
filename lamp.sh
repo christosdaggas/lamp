@@ -70,6 +70,20 @@ open_firewall_port() {
   fi
 }
 
+ensure_listen_443() {
+  local listen_file="/etc/httpd/conf.d/05-listen-ssl.conf"
+
+  # Already listening?
+  if sudo grep -RqsE '^[[:space:]]*Listen[[:space:]]+443' /etc/httpd; then
+    return 0
+  fi
+
+  msg "Enabling Apache HTTPS listener on port 443"
+
+  sudo tee "$listen_file" >/dev/null <<'EOF'
+Listen 443 https
+EOF
+}
 # ============================================================
 # FIX Fedora default ssl.conf if it references missing localhost cert/key
 # ============================================================
@@ -442,7 +456,8 @@ select_vhost() {
 # ============================================================
 issue_self_signed_ssl() {
   select_vhost || return 1
-
+  ensure_listen_443
+  
   sudo mkdir -p "$SSL_CERT_DIR" "$SSL_KEY_DIR"
   sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
     -keyout "${SSL_KEY_DIR}/${SEL_DOMAIN}.key" \
@@ -480,6 +495,7 @@ issue_lets_encrypt_ssl() {
   ensure_httpd_ssl_sane
 
   select_vhost || return 1
+  ensure_listen_443
   read -rp "Email for Let's Encrypt: " EM
   [[ -n "$EM" ]] || { err "Email is required."; return 1; }
 
