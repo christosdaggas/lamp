@@ -83,7 +83,7 @@ EOF
 }
 
 auto_enable_443_if_needed() {
-  if sudo grep -Rqs "<VirtualHost[[:space:]]\+\\*:443>" /etc/httpd/conf.d; then
+  if sudo grep -Rqs "<VirtualHost[[:space:]]\+\\*:443>" /etc/httpd/conf.d 2>/dev/null; then
     ensure_listen_443
   fi
 }
