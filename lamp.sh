@@ -37,6 +37,7 @@ getenforce_safe(){ command -v getenforce >/dev/null 2>&1 && getenforce || echo "
 
 apache_configtest(){
   ensure_httpd_ssl_sane
+  auto_enable_443_if_needed
   sudo apachectl configtest
 }
 
@@ -72,18 +73,21 @@ open_firewall_port() {
 
 ensure_listen_443() {
   local listen_file="/etc/httpd/conf.d/05-listen-ssl.conf"
-
-  # Already listening?
   if sudo grep -RqsE '^[[:space:]]*Listen[[:space:]]+443' /etc/httpd; then
     return 0
   fi
-
   msg "Enabling Apache HTTPS listener on port 443"
-
   sudo tee "$listen_file" >/dev/null <<'EOF'
 Listen 443 https
 EOF
 }
+
+auto_enable_443_if_needed() {
+  if sudo grep -Rqs "<VirtualHost[[:space:]]\+\\*:443>" /etc/httpd/conf.d; then
+    ensure_listen_443
+  fi
+}
+
 # ============================================================
 # FIX Fedora default ssl.conf if it references missing localhost cert/key
 # ============================================================
