@@ -309,6 +309,89 @@ SQL
 }
 
 # ============================================================
+# MARIA DB INIT + CREATE DATABASE(S) AND USER(S)
+# ============================================================
+# ============================================================
+# MARIA DB INIT + CREATE DATABASE(S) AND USER(S)
+# ============================================================
+mariadb_init_and_create_db() {
+  msg "Initializing MariaDB (if needed)..."
+
+  # Install MariaDB if missing
+  install_mariadb_dev || true
+  ensure_mariadb_initialized
+  sudo systemctl restart mariadb
+
+  # Optional secure installation
+  read -rp "Run mysql_secure_installation now? (y/N): " SEC
+  SEC="${SEC:-N}"
+  [[ "$SEC" =~ ^[Yy]$ ]] && sudo mysql_secure_installation || true
+
+  echo
+  msg "You can now create multiple databases and users in one go."
+  echo "Format: db_name:db_user:db_pass:db_host"
+  echo "Example:"
+  echo "prestashop_db:ps_user:secret:localhost"
+  echo "shop_db:shop_user:anotherpass:%"
+  echo "Leave blank line when done."
+
+  local DBS=()
+  while true; do
+    read -rp "Database definition: " LINE
+    [[ -z "$LINE" ]] && break
+    # Validate simple format
+    if [[ ! "$LINE" =~ ^[^:]+:[^:]+:[^:]+(:[^:]*)?$ ]]; then
+      warn "Invalid format. Use: db_name:db_user:db_pass:db_host"
+      continue
+    fi
+    DBS+=("$LINE")
+  done
+
+  # If no DBs entered, fallback to single PrestaShop-style interactive prompt
+  if [[ ${#DBS[@]} -eq 0 ]]; then
+    msg "No multi-DB entries provided. Falling back to single DB creation."
+
+    read -rp "Database name (e.g. prestashop_db): " DB_NAME
+    [[ -n "$DB_NAME" ]] || { err "Database name is required."; return 1; }
+
+    read -rp "DB username (e.g. ps_user): " DB_USER
+    [[ -n "$DB_USER" ]] || { err "DB username is required."; return 1; }
+
+    read -srp "DB password: " DB_PASS
+    echo
+    [[ -n "$DB_PASS" ]] || { err "DB password is required."; return 1; }
+
+    read -rp "DB host (default: localhost, use % for remote): " DB_HOST
+    DB_HOST="${DB_HOST:-localhost}"
+
+    read -rp "Allow this user to CREATE/DROP databases (for PrestaShop 'Create Now')? (y/N): " ALLOW_CREATE
+    ALLOW_CREATE="${ALLOW_CREATE:-N}"
+
+    DBS+=("${DB_NAME}:${DB_USER}:${DB_PASS}:${DB_HOST}:${ALLOW_CREATE}")
+  fi
+
+  # Prepare SQL commands
+  local SQL=""
+  for entry in "${DBS[@]}"; do
+    # Support optional CREATE/DROP grant
+    IFS=":" read -r DB_NAME DB_USER DB_PASS DB_HOST ALLOW_CREATE <<< "$entry"
+    DB_HOST="${DB_HOST:-localhost}"
+
+    SQL+="CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+    SQL+="CREATE USER IF NOT EXISTS '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASS}'; "
+    SQL+="GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}'; "
+    [[ "$ALLOW_CREATE" =~ ^[Yy]$ ]] && SQL+="GRANT CREATE, DROP ON *.* TO '${DB_USER}'@'${DB_HOST}'; "
+  done
+  SQL+="FLUSH PRIVILEGES;"
+
+  # Execute SQL
+  msg "Creating databases and users..."
+  sudo mysql -e "$SQL"
+
+  msg "All databases/users created successfully."
+}
+
+# ============================================================
 # PERMISSIONS (REWRITTEN FOR PURE DEV MODE)
 # ============================================================
 apply_web_permissions_tree() {
