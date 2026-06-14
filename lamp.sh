@@ -263,54 +263,6 @@ ensure_mariadb_initialized() {
   fi
 }
 
-mariadb_init_and_create_db() {
-  msg "Initializing MariaDB (if needed) and creating database/user..."
-
-  if ! rpm -q mariadb-server >/dev/null 2>&1; then
-    install_mariadb_dev
-  else
-    sudo systemctl enable --now mariadb
-  fi
-
-  ensure_mariadb_initialized
-  sudo systemctl restart mariadb
-
-  read -rp "Run mysql_secure_installation now? (y/N): " SEC
-  SEC="${SEC:-N}"
-  if [[ "$SEC" =~ ^[Yy]$ ]]; then
-    sudo mysql_secure_installation || true
-  fi
-
-  read -rp "Database name (e.g. prestashop_db): " DB_NAME
-  [[ -n "$DB_NAME" ]] || { err "Database name is required."; return 1; }
-
-  read -rp "DB username (e.g. ps_user): " DB_USER
-  [[ -n "$DB_USER" ]] || { err "DB username is required."; return 1; }
-
-  read -srp "DB password: " DB_PASS
-  echo
-  [[ -n "$DB_PASS" ]] || { err "DB password is required."; return 1; }
-
-  read -rp "DB host (default: localhost, use % for remote): " DB_HOST
-  DB_HOST="${DB_HOST:-localhost}"
-
-  read -rp "Allow this user to CREATE/DROP databases (for PrestaShop 'Create Now')? (y/N): " ALLOW_CREATE
-  ALLOW_CREATE="${ALLOW_CREATE:-N}"
-
-  msg "Applying SQL (utf8mb4)..."
-  sudo mysql <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASS}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';
-$( [[ "$ALLOW_CREATE" =~ ^[Yy]$ ]] && echo "GRANT CREATE, DROP ON *.* TO '${DB_USER}'@'${DB_HOST}';" )
-FLUSH PRIVILEGES;
-SQL
-  msg "MariaDB initialized. DB/user created successfully."
-}
-
-# ============================================================
-# MARIA DB INIT + CREATE DATABASE(S) AND USER(S)
-# ============================================================
 # ============================================================
 # MARIA DB INIT + CREATE DATABASE(S) AND USER(S)
 # ============================================================
@@ -389,6 +341,97 @@ mariadb_init_and_create_db() {
   sudo mysql -e "$SQL"
 
   msg "All databases/users created successfully."
+}
+
+# ============================================================
+# RESET / CLEAN DATABASE
+# ============================================================
+reset_database() {
+  msg "Reset / Clean Database"
+
+  read -rp "DB admin user (default root): " R_USER
+  R_USER="${R_USER:-root}"
+  read -srp "DB admin password (leave empty for socket auth): " R_PASS
+  echo
+
+  local MYSQL_CMD
+  if [[ -n "$R_PASS" ]]; then
+    MYSQL_CMD=(sudo mysql -u"$R_USER" -p"$R_PASS")
+  else
+    MYSQL_CMD=(sudo mysql -u"$R_USER")
+  fi
+
+  # Connect + list user databases (exclude system schemas)
+  local ALL_DBS
+  if ! ALL_DBS="$("${MYSQL_CMD[@]}" -N -e "SHOW DATABASES;" 2>/dev/null)"; then
+    err "Could not connect to MariaDB. Check credentials."
+    return 1
+  fi
+  local DBS
+  DBS="$(echo "$ALL_DBS" | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)"
+  [[ -z "$DBS" ]] && { warn "No user databases found."; return 1; }
+
+  msg "Available databases:"
+  local i=1
+  declare -A dlist
+  while IFS= read -r dbn; do
+    [[ -z "$dbn" ]] && continue
+    echo "$i) $dbn"
+    dlist[$i]="$dbn"
+    i=$((i+1))
+  done <<< "$DBS"
+
+  read -rp "Select database number: " dchoice
+  local DB_NAME="${dlist[$dchoice]:-}"
+  [[ -z "$DB_NAME" ]] && { err "Invalid selection."; return 1; }
+
+  echo
+  echo "Reset mode for '${DB_NAME}':"
+  echo "  1) Clean    - drop ALL tables (keeps the DB + users/grants)"
+  echo "  2) Recreate - DROP DATABASE then create it empty (utf8mb4)"
+  echo "  3) Drop     - DROP DATABASE permanently (no recreate)"
+  read -rp "Mode (1/2/3): " MODE
+
+  warn "This will DESTROY data in '${DB_NAME}'."
+  read -rp "Type the database name to confirm: " CONFIRM
+  [[ "$CONFIRM" == "$DB_NAME" ]] || { err "Confirmation did not match. Aborted."; return 1; }
+
+  case "$MODE" in
+    1)
+      msg "Dropping all tables in ${DB_NAME}..."
+      local DROP_SQL
+      DROP_SQL="$("${MYSQL_CMD[@]}" -N -e \
+        "SELECT CONCAT('DROP TABLE IF EXISTS \`', table_name, '\`;') \
+         FROM information_schema.tables WHERE table_schema='${DB_NAME}';")"
+      if [[ -z "$DROP_SQL" ]]; then
+        warn "Database is already empty."
+      else
+        "${MYSQL_CMD[@]}" "$DB_NAME" <<SQL
+SET FOREIGN_KEY_CHECKS=0;
+${DROP_SQL}
+SET FOREIGN_KEY_CHECKS=1;
+SQL
+        msg "All tables dropped. '${DB_NAME}' is now empty."
+      fi
+      ;;
+    2)
+      msg "Recreating ${DB_NAME}..."
+      "${MYSQL_CMD[@]}" <<SQL
+DROP DATABASE IF EXISTS \`${DB_NAME}\`;
+CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+SQL
+      msg "'${DB_NAME}' recreated empty."
+      ;;
+    3)
+      msg "Dropping ${DB_NAME}..."
+      "${MYSQL_CMD[@]}" -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;"
+      msg "'${DB_NAME}' dropped."
+      ;;
+    *)
+      err "Invalid mode."
+      return 1
+      ;;
+  esac
 }
 
 # ============================================================
@@ -474,6 +517,25 @@ apply_dev_permissions() {
   fi
 }
 
+# Re-apply DEV permissions to a single directory (must be inside WEB_DIR)
+reapply_permissions_path() {
+  read -rp "Absolute path to apply DEV permissions on (inside ${WEB_DIR}): " TARGET
+  [[ -n "$TARGET" ]] || { err "Path is required."; return 1; }
+
+  # Strip a trailing slash for consistent matching
+  TARGET="${TARGET%/}"
+
+  # Safety guard: only allow paths inside WEB_DIR (the recursive chown/chmod/setfacl is dangerous)
+  case "$TARGET" in
+    "$WEB_DIR"|"$WEB_DIR"/*) ;;
+    *) err "Refusing: path must be inside ${WEB_DIR}"; return 1 ;;
+  esac
+
+  [[ -d "$TARGET" ]] || { err "Directory not found: $TARGET"; return 1; }
+
+  apply_web_permissions_tree "$TARGET"
+}
+
 # ============================================================
 # VHOSTS
 # ============================================================
@@ -536,6 +598,73 @@ select_vhost() {
 
   IFS='|' read -r SEL_DOMAIN SEL_CONF <<< "${list[$choice]}"
   SEL_DOCROOT="$(sudo awk '/^[[:space:]]*DocumentRoot[[:space:]]+/ {print $2; exit}' "$SEL_CONF")"
+}
+
+# Delete a VHost (config, optional SSL/hosts/docroot/logs)
+delete_vhost() {
+  select_vhost || return 1
+
+  warn "About to delete VHost: ${SEL_DOMAIN}"
+  echo "  Config:  ${SEL_CONF}"
+  echo "  DocRoot: ${SEL_DOCROOT}"
+  read -rp "Proceed with deleting the VHost config? (y/N): " CONF
+  CONF="${CONF:-N}"
+  [[ "$CONF" =~ ^[Yy]$ ]] || { msg "Delete cancelled."; return 0; }
+
+  # 1. Remove the vhost config
+  if [[ -f "$SEL_CONF" ]]; then
+    sudo rm -f "$SEL_CONF"
+    msg "Removed config: $SEL_CONF"
+  fi
+
+  # 2. Remove self-signed SSL cert/key if present
+  if [[ -f "${SSL_CERT_DIR}/${SEL_DOMAIN}.crt" || -f "${SSL_KEY_DIR}/${SEL_DOMAIN}.key" ]]; then
+    read -rp "Remove SSL cert/key for ${SEL_DOMAIN}? (y/N): " RMSSL
+    RMSSL="${RMSSL:-N}"
+    if [[ "$RMSSL" =~ ^[Yy]$ ]]; then
+      sudo rm -f "${SSL_CERT_DIR}/${SEL_DOMAIN}.crt" "${SSL_KEY_DIR}/${SEL_DOMAIN}.key"
+      msg "Removed SSL cert/key."
+    fi
+  fi
+
+  # 3. Remove /etc/hosts entry
+  if grep -Eq "(^|[[:space:]])${SEL_DOMAIN}([[:space:]]|\$)" /etc/hosts; then
+    read -rp "Remove /etc/hosts entry for ${SEL_DOMAIN}? (y/N): " RMH
+    RMH="${RMH:-N}"
+    [[ "$RMH" =~ ^[Yy]$ ]] && manage_hosts_entry remove "$SEL_DOMAIN"
+  fi
+
+  # 4. Optionally delete the document root (guarded: must live under WEB_DIR)
+  if [[ -n "$SEL_DOCROOT" && -d "$SEL_DOCROOT" \
+        && "$SEL_DOCROOT" != "$WEB_DIR" && "$SEL_DOCROOT" == "$WEB_DIR"/* ]]; then
+    warn "DocumentRoot: ${SEL_DOCROOT}"
+    read -rp "DELETE the document root folder and ALL its files? (y/N): " RMDOC
+    RMDOC="${RMDOC:-N}"
+    if [[ "$RMDOC" =~ ^[Yy]$ ]]; then
+      read -rp "Are you sure? Type the domain name to confirm: " CONFIRM
+      if [[ "$CONFIRM" == "$SEL_DOMAIN" ]]; then
+        sudo rm -rf "$SEL_DOCROOT"
+        msg "Removed docroot: ${SEL_DOCROOT}"
+      else
+        warn "Confirmation did not match. Keeping files."
+      fi
+    fi
+  else
+    warn "DocRoot not offered for deletion (it's the base web dir or outside ${WEB_DIR})."
+  fi
+
+  # 5. Remove log files
+  read -rp "Remove Apache log files for ${SEL_DOMAIN}? (y/N): " RMLOG
+  RMLOG="${RMLOG:-N}"
+  if [[ "$RMLOG" =~ ^[Yy]$ ]]; then
+    sudo rm -f "/var/log/httpd/${SEL_DOMAIN}_error.log" \
+               "/var/log/httpd/${SEL_DOMAIN}_access.log"
+    msg "Removed log files."
+  fi
+
+  safe_reload_httpd
+  SEL_DOMAIN=""; SEL_DOCROOT=""; SEL_CONF=""
+  msg "VHost deleted."
 }
 
 # ============================================================
@@ -728,7 +857,7 @@ restore_project() {
 # ============================================================
 main_menu() {
   while true; do
-    echo -e "\n--- Fedora 43 LAMP DEV (v3.8 - DEV PERMS) ---"
+    echo -e "\n--- Fedora 43 LAMP DEV (v3.9 - DEV PERMS) ---"
     echo "1) Full Install (Apache, PHP, MariaDB, Perms)"
     echo "2) Create New VHost"
     echo "3) Issue Self-Signed SSL"
@@ -739,6 +868,9 @@ main_menu() {
     echo "8) Re-apply permissions on /var/www/html"
     echo "9) Restart services"
     echo "10) Initialize MariaDB + Create DB/User"
+    echo "11) Reset / Clean a Database"
+    echo "12) Delete a VHost"
+    echo "13) Re-apply permissions on a specific directory"
     echo "0) Exit"
     read -rp "Choice: " C
     case "$C" in
@@ -752,6 +884,9 @@ main_menu() {
       8) apply_dev_permissions ;;
       9) sudo systemctl restart mariadb 2>/dev/null || true; sudo systemctl restart php-fpm 2>/dev/null || true; sudo systemctl restart httpd 2>/dev/null || true; msg "Services restarted." ;;
       10) mariadb_init_and_create_db ;;
+      11) reset_database ;;
+      12) delete_vhost ;;
+      13) reapply_permissions_path ;;
       0) exit 0 ;;
       *) err "Invalid choice." ;;
     esac
